@@ -15,9 +15,11 @@ pub struct Matcher {
 impl Matcher {
     /// Reads `winnow_file` and builds a matcher rooted at its parent directory.
     ///
-    /// Fails if the file cannot be read or contains an invalid pattern.
+    /// Fails if `winnow_file` has no parent directory, cannot be read, or contains an invalid pattern.
     pub fn load(winnow_file: &Path) -> anyhow::Result<Matcher> {
-        let root = winnow_file.parent().unwrap_or(Path::new(""));
+        let root = winnow_file
+            .parent()
+            .with_context(|| format!("{} has no parent directory", winnow_file.display()))?;
         let mut builder = GitignoreBuilder::new(root);
         if let Some(err) = builder.add(winnow_file) {
             bail!(err);
