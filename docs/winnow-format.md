@@ -96,9 +96,9 @@ project. Nothing in that project is deleted.
 
 `winnower clean --older-than <DURATION>` (default `30d`) only cleans projects with no activity
 for at least that long. A project's activity is the newest modification time of any file in it
-that is **not** matched by `.winnow`: source files, not build output. This includes the
-`.winnow` file itself, so creating or editing it counts as a change. `.git` contents are not
-counted. A project with no unmatched files counts as inactive.
+that is **not** matched by `.winnow`: source files, not build output. The `.winnow` file itself
+and `.git` contents are not counted, so adding a `.winnow` file to a stale project does not make
+it look active. A project with no other unmatched files counts as inactive.
 
 ## Example
 

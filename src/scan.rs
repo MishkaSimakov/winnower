@@ -20,8 +20,8 @@ const GIT_DIR: &str = ".git";
 pub struct Project {
     /// The directory that contains the `.winnow` file.
     pub root: PathBuf,
-    /// The newest modification time of an unmatched file in the project,
-    /// or the Unix epoch if there is no such file.
+    /// The newest modification time of an unmatched file in the project other than
+    /// its `.winnow` file, or the Unix epoch if there is no such file.
     pub last_activity: SystemTime,
     /// The matched paths, in walk order.
     pub targets: Vec<Target>,
@@ -165,7 +165,8 @@ fn nested_winnow_error(nested: &Path, project_root: &Path) -> anyhow::Error {
 }
 
 /// Loads the `.winnow` file of the project at `root` and walks the project,
-/// collecting targets and the newest modification time of unmatched files.
+/// collecting targets and the newest modification time of unmatched files
+/// other than the project's `.winnow` file.
 ///
 /// Fails if the `.winnow` file is invalid, another `.winnow` file exists below `root`,
 /// or any entry cannot be read.
@@ -191,7 +192,7 @@ fn scan_project(root: &Path) -> anyhow::Result<Project> {
                 entries.skip_current_dir();
             }
             targets.push(target(entry, root)?);
-        } else if file_type.is_file() {
+        } else if file_type.is_file() && !is_winnow_file(&entry) {
             let modified = entry
                 .metadata()?
                 .modified()
@@ -498,6 +499,18 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(project.last_activity, source_mtime);
+    }
+
+    // A fresh `.winnow` file does not make an old project look active.
+    #[test]
+    fn activity_ignores_winnow_file() {
+        let d = TempDir::new().unwrap();
+        write(d.path(), ".winnow", "build/\n");
+        create(d.path(), &["src/main.c", "build/out.o"]);
+        age(d.path(), "src/main.c", 90);
+        let result = scan_with(d.path(), 30 * DAY);
+        assert!(result.skipped_recent.is_empty());
+        assert_eq!(target_paths(&result.to_clean[0]), ["build"]);
     }
 
     // A project changed recently is skipped by a 30-day filter.

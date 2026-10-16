@@ -81,7 +81,8 @@ paths with their sizes, asks for confirmation, and deletes them.
 
 `--older-than` (default `30d`) only cleans projects you have not touched for that long, so the
 build directory of the project you are working on today is left alone. A project's last change
-is the newest modification time of its files that are **not** matched by `.winnow`. Durations
+is the newest modification time of its files that are **not** matched by `.winnow`, not
+counting `.winnow` itself. Durations
 such as `12h`, `2w`, or `6months` are accepted. `--older-than 0` cleans every project.
 
 Exit code `0` means success, nothing to do, or the deletion was declined. `1` means a runtime
