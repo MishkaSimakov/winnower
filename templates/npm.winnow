@@ -1,0 +1,7 @@
+# Node.js dependencies and framework caches
+node_modules/
+.next/
+.nuxt/
+.turbo/
+.parcel-cache/
+.svelte-kit/

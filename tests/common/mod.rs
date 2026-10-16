@@ -1,4 +1,6 @@
 //! Helpers for building fake project trees and running the binary.
+//! Each test crate uses only some of them.
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;
