@@ -11,22 +11,7 @@ Each project lists its disposable paths in a `.winnow` file, written in `.gitign
 `winnower clean` walks a directory tree, finds every `.winnow` file, shows what would be deleted
 and how much space it takes, asks for confirmation, and deletes.
 
-```console
-$ winnower clean ~/projects
-~/projects/game        last change 94 days ago
-    1.3 GB  Library/
-  325.1 MB  Temp/
-~/projects/raytracer   last change 41 days ago
-  859.8 MB  cmake-build-debug/
-   12.6 MB  cmake-build-release/
-
-Skipped (changed within 30days):
-  ~/projects/winnower  last change 0 days ago
-
-Total: 4 items, 2.5 GB in 2 projects.
-Delete permanently? [y/N] y
-Deleted 4 items, freed 2.5 GB.
-```
+![winnower clean deleting build directories from two old projects and skipping a recent one](docs/demo.gif)
 
 > [!WARNING]
 > **Deletion is permanent.** Files are not moved to the Trash, and there is no undo. The
