@@ -1,11 +1,16 @@
 //! Finding projects, the paths their `.winnow` files match, and how recently they changed.
+//!
+//! Directories are walked in parallel. Results are combined in walk order: entries of a
+//! directory sorted by name, each directory before its contents.
 
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, FileType, Metadata};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow};
-use walkdir::{DirEntry, WalkDir};
+use rayon::prelude::*;
 
 use crate::winnow_file::Matcher;
 
@@ -77,11 +82,18 @@ pub struct ScanResult {
 /// scanned, is left out of both lists and produces a warning. An unreadable directory
 /// outside any project also produces a warning. Fails only if `root` cannot be read.
 pub fn scan(root: &Path, options: &ScanOptions) -> anyhow::Result<ScanResult> {
-    let (project_roots, mut warnings) = discover(root)?;
+    let Discovery {
+        project_roots,
+        mut warnings,
+    } = discover(root)?;
+    let scanned: Vec<_> = project_roots
+        .into_par_iter()
+        .map(|project_root| (scan_project(&project_root), project_root))
+        .collect();
     let mut to_clean = Vec::new();
     let mut skipped_recent = Vec::new();
-    for project_root in project_roots {
-        match scan_project(&project_root) {
+    for (scanned, project_root) in scanned {
+        match scanned {
             Ok(project) if is_inactive(&project, options) => to_clean.push(project),
             Ok(project) => skipped_recent.push(project),
             Err(err) => warnings.push(format!(
@@ -106,53 +118,160 @@ fn is_inactive(project: &Project, options: &ScanOptions) -> bool {
     age >= options.older_than
 }
 
-/// Returns a walker over `root` that does not follow symlinks or cross filesystems
-/// and visits entries in name order.
-fn walker(root: &Path) -> WalkDir {
-    WalkDir::new(root)
-        .follow_links(false)
-        .same_file_system(true)
-        .sort_by_file_name()
+/// An entry of a directory. Symlinks are not followed.
+struct Entry {
+    /// The full path of the entry.
+    path: PathBuf,
+    /// The name of the entry within its directory.
+    name: OsString,
+    /// The type of the entry itself, not of what a symlink points to.
+    file_type: FileType,
+}
+
+impl Entry {
+    /// Returns whether the entry is a `.winnow` entry that is not a directory.
+    fn is_winnow_file(&self) -> bool {
+        self.name == WINNOW_FILE && !self.file_type.is_dir()
+    }
+}
+
+/// Returns the entries of `dir`, sorted by name.
+fn read_dir(dir: &Path) -> anyhow::Result<Vec<Entry>> {
+    let mut entries = retry(|| {
+        fs::read_dir(dir)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok(Entry {
+                    path: entry.path(),
+                    name: entry.file_name(),
+                    file_type: entry.file_type()?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })
+    .with_context(|| format!("reading {}", dir.display()))?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// Runs `operation` again for as long as it fails because a system call was interrupted.
+fn retry<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Returns the metadata of `path` itself, without following a symlink.
+fn metadata(path: &Path) -> anyhow::Result<Metadata> {
+    retry(|| fs::symlink_metadata(path))
+        .with_context(|| format!("reading metadata of {}", path.display()))
+}
+
+/// Returns the ID of the filesystem that contains `path`, following symlinks.
+#[cfg(unix)]
+fn device_of(path: &Path) -> anyhow::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    retry(|| fs::metadata(path))
+        .map(|metadata| metadata.dev())
+        .with_context(|| format!("reading metadata of {}", path.display()))
+}
+
+/// Returns the same ID for every path, so filesystem boundaries are not detected.
+#[cfg(not(unix))]
+fn device_of(_path: &Path) -> anyhow::Result<u64> {
+    Ok(0)
+}
+
+/// Project roots and warnings found while discovering projects, in walk order.
+struct Discovery {
+    /// Directories that contain a `.winnow` file.
+    project_roots: Vec<PathBuf>,
+    /// A warning for each directory that could not be read.
+    warnings: Vec<String>,
+}
+
+impl Discovery {
+    /// Returns a discovery that found nothing.
+    fn empty() -> Discovery {
+        Discovery {
+            project_roots: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Returns a discovery of the single project at `root`.
+    fn project(root: PathBuf) -> Discovery {
+        Discovery {
+            project_roots: vec![root],
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Returns a discovery with the single warning `warning`.
+    fn warning(warning: String) -> Discovery {
+        Discovery {
+            project_roots: Vec::new(),
+            warnings: vec![warning],
+        }
+    }
+
+    /// Appends the findings of `other`, which come after those of `self` in walk order.
+    fn merge(mut self, other: Discovery) -> Discovery {
+        self.project_roots.extend(other.project_roots);
+        self.warnings.extend(other.warnings);
+        self
+    }
 }
 
 /// Returns the directories under `root` that contain a `.winnow` file, without looking
 /// inside them, and a warning for each directory that could not be read.
-fn discover(root: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
-    let mut project_roots = Vec::new();
-    let mut warnings = Vec::new();
-    let mut entries = walker(root).into_iter();
-    while let Some(entry) = entries.next() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) if err.depth() == 0 => {
-                return Err(err).with_context(|| format!("reading {}", root.display()));
-            }
-            Err(err) => {
-                warnings.push(format!("skipping directory: {err}"));
-                continue;
-            }
-        };
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-        if entry.file_name() == GIT_DIR {
-            entries.skip_current_dir();
-        } else if has_winnow_file(entry.path()) {
-            project_roots.push(entry.into_path());
-            entries.skip_current_dir();
-        }
+///
+/// Fails if `root` cannot be read. A `root` that is not a directory contains no projects.
+fn discover(root: &Path) -> anyhow::Result<Discovery> {
+    let root_metadata =
+        retry(|| fs::metadata(root)).with_context(|| format!("reading {}", root.display()))?;
+    if !root_metadata.is_dir() {
+        return Ok(Discovery::empty());
     }
-    Ok((project_roots, warnings))
+    if has_winnow_file(root) {
+        return Ok(Discovery::project(root.to_path_buf()));
+    }
+    let device = device_of(root)?;
+    Ok(discover_entries(&read_dir(root)?, device))
+}
+
+/// Discovers projects in the subdirectories among `entries`, other than `.git`.
+fn discover_entries(entries: &[Entry], device: u64) -> Discovery {
+    entries
+        .par_iter()
+        .filter(|entry| entry.file_type.is_dir() && entry.name != GIT_DIR)
+        .map(|entry| discover_dir(&entry.path, device))
+        .reduce(Discovery::empty, Discovery::merge)
+}
+
+/// Discovers projects in `dir` and below. `dir` is entered only if it is on the
+/// filesystem `device`.
+fn discover_dir(dir: &Path, device: u64) -> Discovery {
+    if has_winnow_file(dir) {
+        return Discovery::project(dir.to_path_buf());
+    }
+    let entries = match device_of(dir) {
+        Ok(dir_device) if dir_device != device => return Discovery::empty(),
+        Ok(_) => read_dir(dir),
+        Err(err) => Err(err),
+    };
+    match entries {
+        Ok(entries) => discover_entries(&entries, device),
+        Err(err) => Discovery::warning(format!("skipping directory: {err:#}")),
+    }
 }
 
 /// Returns whether `dir` directly contains a `.winnow` entry that is not a directory.
 fn has_winnow_file(dir: &Path) -> bool {
-    fs::symlink_metadata(dir.join(WINNOW_FILE)).is_ok_and(|metadata| !metadata.is_dir())
-}
-
-/// Returns whether `entry` is a `.winnow` entry that is not a directory.
-fn is_winnow_file(entry: &DirEntry) -> bool {
-    entry.file_name() == WINNOW_FILE && !entry.file_type().is_dir()
+    retry(|| fs::symlink_metadata(dir.join(WINNOW_FILE))).is_ok_and(|metadata| !metadata.is_dir())
 }
 
 /// Returns the error for a `.winnow` file at `nested` inside the project at `project_root`.
@@ -164,6 +283,42 @@ fn nested_winnow_error(nested: &Path, project_root: &Path) -> anyhow::Error {
     )
 }
 
+/// Targets and activity found in part of a project.
+struct Contents {
+    /// The newest modification time of an unmatched file other than the project's
+    /// `.winnow` file, or the Unix epoch if there is no such file.
+    last_activity: SystemTime,
+    /// The matched paths, in walk order.
+    targets: Vec<Target>,
+}
+
+impl Contents {
+    /// Returns contents with no targets and no activity.
+    fn empty() -> Contents {
+        Contents {
+            last_activity: SystemTime::UNIX_EPOCH,
+            targets: Vec::new(),
+        }
+    }
+
+    /// Appends the findings of `other`, which come after those of `self` in walk order.
+    fn merge(mut self, other: Contents) -> Contents {
+        self.last_activity = self.last_activity.max(other.last_activity);
+        self.targets.extend(other.targets);
+        self
+    }
+}
+
+/// A project whose entries are being scanned.
+struct ProjectScan<'a> {
+    /// The directory that contains the `.winnow` file.
+    root: &'a Path,
+    /// The patterns of the project's `.winnow` file.
+    matcher: Matcher,
+    /// The filesystem that contains the project root.
+    device: u64,
+}
+
 /// Loads the `.winnow` file of the project at `root` and walks the project,
 /// collecting targets and the newest modification time of unmatched files
 /// other than the project's `.winnow` file.
@@ -171,74 +326,102 @@ fn nested_winnow_error(nested: &Path, project_root: &Path) -> anyhow::Error {
 /// Fails if the `.winnow` file is invalid, another `.winnow` file exists below `root`,
 /// or any entry cannot be read.
 fn scan_project(root: &Path) -> anyhow::Result<Project> {
-    let matcher = Matcher::load(&root.join(WINNOW_FILE))?;
-    let mut last_activity = SystemTime::UNIX_EPOCH;
-    let mut targets = Vec::new();
-    let mut entries = walker(root).min_depth(1).into_iter();
-    while let Some(entry) = entries.next() {
-        let entry = entry?;
-        let file_type = entry.file_type();
-        if entry.file_name() == GIT_DIR {
-            if file_type.is_dir() {
-                entries.skip_current_dir();
-            }
-            continue;
-        }
-        if entry.depth() > 1 && is_winnow_file(&entry) {
-            return Err(nested_winnow_error(entry.path(), root));
-        }
-        if matcher.is_match(entry.path(), file_type.is_dir()) {
-            if file_type.is_dir() {
-                entries.skip_current_dir();
-            }
-            targets.push(target(entry, root)?);
-        } else if file_type.is_file() && !is_winnow_file(&entry) {
-            let modified = entry
-                .metadata()?
-                .modified()
-                .with_context(|| format!("reading mtime of {}", entry.path().display()))?;
-            last_activity = last_activity.max(modified);
-        }
-    }
+    let project = ProjectScan {
+        root,
+        matcher: Matcher::load(&root.join(WINNOW_FILE))?,
+        device: device_of(root)?,
+    };
+    let contents = project.scan_dir(root, 1)?;
     Ok(Project {
         root: root.to_path_buf(),
-        last_activity,
-        targets,
+        last_activity: contents.last_activity,
+        targets: contents.targets,
     })
 }
 
+impl ProjectScan<'_> {
+    /// Scans the entries of `dir`, which are `depth` levels below the project root.
+    fn scan_dir(&self, dir: &Path, depth: usize) -> anyhow::Result<Contents> {
+        read_dir(dir)?
+            .par_iter()
+            .map(|entry| self.scan_entry(entry, depth))
+            .try_reduce(Contents::empty, |a, b| Ok(a.merge(b)))
+    }
+
+    /// Scans `entry`, which is `depth` levels below the project root, and everything
+    /// inside it unless it is matched, is `.git`, or is on another filesystem.
+    fn scan_entry(&self, entry: &Entry, depth: usize) -> anyhow::Result<Contents> {
+        let file_type = entry.file_type;
+        if entry.name == GIT_DIR {
+            return Ok(Contents::empty());
+        }
+        if depth > 1 && entry.is_winnow_file() {
+            return Err(nested_winnow_error(&entry.path, self.root));
+        }
+        if self.matcher.is_match(&entry.path, file_type.is_dir()) {
+            let mut contents = Contents::empty();
+            contents.targets.push(target(entry, self.root)?);
+            return Ok(contents);
+        }
+        if file_type.is_file() && !entry.is_winnow_file() {
+            let modified = metadata(&entry.path)?
+                .modified()
+                .with_context(|| format!("reading mtime of {}", entry.path.display()))?;
+            let mut contents = Contents::empty();
+            contents.last_activity = modified;
+            return Ok(contents);
+        }
+        if file_type.is_dir() && device_of(&entry.path)? == self.device {
+            return self.scan_dir(&entry.path, depth + 1);
+        }
+        Ok(Contents::empty())
+    }
+}
+
 /// Builds the target for a matched `entry` of the project at `project_root`.
-fn target(entry: DirEntry, project_root: &Path) -> anyhow::Result<Target> {
-    let file_type = entry.file_type();
+fn target(entry: &Entry, project_root: &Path) -> anyhow::Result<Target> {
+    let file_type = entry.file_type;
     let (kind, size) = if file_type.is_dir() {
-        (TargetKind::Dir, dir_size(entry.path(), project_root)?)
+        (TargetKind::Dir, dir_size(&entry.path, project_root)?)
     } else if file_type.is_symlink() {
-        (TargetKind::Symlink, entry.metadata()?.len())
+        (TargetKind::Symlink, metadata(&entry.path)?.len())
     } else {
-        (TargetKind::File, entry.metadata()?.len())
+        (TargetKind::File, metadata(&entry.path)?.len())
     };
     Ok(Target {
-        path: entry.into_path(),
+        path: entry.path.clone(),
         kind,
         size,
     })
 }
 
-/// Returns the sum of the lengths of every file and symlink inside `dir`.
+/// Returns the sum of the lengths of every file and symlink inside `dir`, without
+/// entering directories on another filesystem than `dir`.
 ///
 /// Fails if a `.winnow` file is found inside `dir` or any entry cannot be read.
 fn dir_size(dir: &Path, project_root: &Path) -> anyhow::Result<u64> {
-    let mut size = 0;
-    for entry in walker(dir).min_depth(1) {
-        let entry = entry?;
-        if is_winnow_file(&entry) {
-            return Err(nested_winnow_error(entry.path(), project_root));
-        }
-        if !entry.file_type().is_dir() {
-            size += entry.metadata()?.len();
-        }
-    }
-    Ok(size)
+    contents_size(dir, device_of(dir)?, project_root)
+}
+
+/// Returns the sum of the lengths of every file and symlink inside `dir`, without
+/// entering directories on another filesystem than `device`.
+///
+/// Fails if a `.winnow` file is found inside `dir` or any entry cannot be read.
+fn contents_size(dir: &Path, device: u64, project_root: &Path) -> anyhow::Result<u64> {
+    read_dir(dir)?
+        .par_iter()
+        .map(|entry| {
+            if entry.is_winnow_file() {
+                Err(nested_winnow_error(&entry.path, project_root))
+            } else if !entry.file_type.is_dir() {
+                Ok(metadata(&entry.path)?.len())
+            } else if device_of(&entry.path)? == device {
+                contents_size(&entry.path, device, project_root)
+            } else {
+                Ok(0)
+            }
+        })
+        .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
 #[cfg(test)]
@@ -407,6 +590,46 @@ mod tests {
         assert_eq!(target_paths(project), ["logs/debug.log"]);
         assert_eq!(project.targets[0].kind, TargetKind::File);
         assert_eq!(project.targets[0].size, 4);
+    }
+
+    // Targets in different directories are listed in walk order: by name, each directory before its contents.
+    #[test]
+    fn targets_are_in_walk_order() {
+        let d = TempDir::new().unwrap();
+        write(d.path(), ".winnow", "*.log\n");
+        create(
+            d.path(),
+            &["b.log", "a/z.log", "a/b/y.log", "a/a.log", "c/x.log"],
+        );
+        let result = scan_all(d.path());
+        assert_eq!(
+            target_paths(&result.to_clean[0]),
+            ["a/a.log", "a/b/y.log", "a/z.log", "b.log", "c/x.log"]
+        );
+    }
+
+    // Projects in different directories are listed in walk order.
+    #[test]
+    fn projects_are_in_walk_order() {
+        let d = TempDir::new().unwrap();
+        for project in ["c", "a/b", "b", "a/a/a", "a/c"] {
+            write(d.path(), &format!("{project}/.winnow"), "build/\n");
+        }
+        let result = scan_all(d.path());
+        assert_eq!(
+            roots(&result.to_clean, d.path()),
+            ["a/a/a", "a/b", "a/c", "b", "c"]
+        );
+    }
+
+    // A scan root that is a file produces no projects and no warnings.
+    #[test]
+    fn file_scan_root_produces_no_projects() {
+        let d = TempDir::new().unwrap();
+        create(d.path(), &["file"]);
+        let result = scan_all(&d.path().join("file"));
+        assert!(result.to_clean.is_empty());
+        assert!(result.warnings.is_empty());
     }
 
     // With `build/*` + `!build/keep`, every entry of `build/` except `keep` is a target and `build/` is not.
