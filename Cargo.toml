@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Frees disk space by deleting generated files listed in per-project .winnow files"
 license = "MIT"
+repository = "https://github.com/MishkaSimakov/winnower"
+readme = "README.md"
+keywords = ["cleanup", "disk-space", "node_modules", "gitignore", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = ["/.github", "/docs/demo.gif"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -17,3 +22,8 @@ assert_cmd = "2.2.2"
 filetime = "0.2.29"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
