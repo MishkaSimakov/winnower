@@ -96,6 +96,34 @@ mod tests {
         }
     }
 
+    /// Loads the template called `name` into a temporary project.
+    fn load(name: &str) -> (TempDir, Matcher) {
+        let dir = TempDir::new().unwrap();
+        let winnow_file = dir.path().join(".winnow");
+        fs::write(&winnow_file, find_template(name).unwrap().content).unwrap();
+        let matcher = Matcher::load(&winnow_file).unwrap();
+        (dir, matcher)
+    }
+
+    // The python template matches the root `venv` but not the stdlib `venv` package sources.
+    #[test]
+    fn python_matches_only_root_venv() {
+        let (dir, matcher) = load("python");
+        assert!(matcher.is_match(&dir.path().join("venv"), true));
+        assert!(!matcher.is_match(&dir.path().join("Lib/venv"), true));
+        assert!(!matcher.is_match(&dir.path().join("pkg/stdlib/venv"), true));
+    }
+
+    // The gradle template matches the root `build` but not a `build` package or docs directory.
+    #[test]
+    fn gradle_matches_only_root_build() {
+        let (dir, matcher) = load("gradle");
+        assert!(matcher.is_match(&dir.path().join("build"), true));
+        let package = dir.path().join("src/main/java/com/example/build");
+        assert!(!matcher.is_match(&package, true));
+        assert!(!matcher.is_match(&dir.path().join("docs/build"), true));
+    }
+
     // Every built-in template starts with a non-empty description comment.
     #[test]
     fn every_template_starts_with_description() {

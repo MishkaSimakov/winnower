@@ -1,6 +1,6 @@
 # Python virtualenvs and tool caches
 .venv/
-venv/
+/venv/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
