@@ -91,13 +91,14 @@ Lists the built-in templates:
 
 ```console
 $ winnower templates
-cargo    Rust / Cargo build output
-cmake    CMake and CLion build directories
-gradle   Gradle caches and build output
-maven    Maven build output
-npm      Node.js dependencies and framework caches
-python   Python virtualenvs and tool caches
-unity    Unity generated folders
+cargo      Rust / Cargo build output
+cmake      CMake and CLion build directories
+composer   PHP / Composer dependencies
+gradle     Gradle caches and build output
+maven      Maven build output
+npm        Node.js dependencies and framework caches
+python     Python virtualenvs and tool caches
+unity      Unity generated folders
 ```
 
 Templates are conservative: they only list paths that tools always regenerate. The full

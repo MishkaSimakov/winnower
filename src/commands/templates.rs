@@ -38,7 +38,7 @@ mod tests {
     fn list_shows_names_and_descriptions() {
         let text = list();
         assert_eq!(text.lines().count(), BUILTIN.len());
-        assert!(text.contains("cargo    Rust / Cargo build output\n"));
-        assert!(text.contains("python   Python virtualenvs and tool caches\n"));
+        assert!(text.contains("cargo      Rust / Cargo build output\n"));
+        assert!(text.contains("python     Python virtualenvs and tool caches\n"));
     }
 }

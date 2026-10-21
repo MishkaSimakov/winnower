@@ -31,6 +31,10 @@ pub const BUILTIN: &[Template] = &[
         content: include_str!("../templates/cmake.winnow"),
     },
     Template {
+        name: "composer",
+        content: include_str!("../templates/composer.winnow"),
+    },
+    Template {
         name: "gradle",
         content: include_str!("../templates/gradle.winnow"),
     },
@@ -122,6 +126,15 @@ mod tests {
         let package = dir.path().join("src/main/java/com/example/build");
         assert!(!matcher.is_match(&package, true));
         assert!(!matcher.is_match(&dir.path().join("docs/build"), true));
+    }
+
+    // The composer template matches the root `vendor` but not Laravel's published vendor files.
+    #[test]
+    fn composer_matches_only_root_vendor() {
+        let (dir, matcher) = load("composer");
+        assert!(matcher.is_match(&dir.path().join("vendor"), true));
+        assert!(!matcher.is_match(&dir.path().join("resources/views/vendor"), true));
+        assert!(!matcher.is_match(&dir.path().join("public/vendor"), true));
     }
 
     // Every built-in template starts with a non-empty description comment.
